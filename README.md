@@ -2,6 +2,8 @@
 
 A compact music player in the Obsidian sidebar. Start a playlist, skip a track, and see what is playing without leaving your notes.
 
+<img src="screenshot.png" width="300" alt="Mini Player in the Obsidian sidebar">
+
 This plugin is **only the interface**. It does not play audio itself — it controls [go-librespot](https://github.com/devgianlu/go-librespot), a lightweight Spotify Connect client that you install and run yourself.
 
 ## What this is (and what it is not)
