@@ -21,7 +21,7 @@
 
 const {
   Plugin, ItemView, PluginSettingTab, Setting, Notice, requestUrl,
-  Modal, FuzzySuggestModal,
+  Modal, FuzzySuggestModal, setIcon,
 } = require('obsidian');
 
 const VIEW_TYPE_MINI_PLAYER = 'mini-player-view';
@@ -34,6 +34,24 @@ const DEFAULT_SETTINGS = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * How long to wait for the local API before giving up.
+ *
+ * This is what separates "go-librespot is not running" from "go-librespot is
+ * running but wedged". A dead port refuses the connection immediately; a hung
+ * process accepts it and then never answers. requestUrl has no timeout of its
+ * own, so the race below supplies one.
+ */
+const REQUEST_TIMEOUT_MS = 3000;
+
+/** Marks the timeout case so callers can tell the two failures apart. */
+class TimeoutError extends Error {
+  constructor(path) {
+    super('API ' + path + ' did not respond');
+    this.name = 'TimeoutError';
+  }
+}
+
 /** Call the local go-librespot API. */
 async function callApi(baseUrl, path, method = 'GET', body = null) {
   const opts = {
@@ -45,7 +63,20 @@ async function callApi(baseUrl, path, method = 'GET', body = null) {
     opts.contentType = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await requestUrl(opts);
+
+  let timer;
+  let res;
+  try {
+    res = await Promise.race([
+      requestUrl(opts),
+      new Promise((_, reject) => {
+        timer = window.setTimeout(() => reject(new TimeoutError(path)), REQUEST_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    window.clearTimeout(timer);
+  }
+
   if (res.status < 200 || res.status >= 300) {
     throw new Error('API ' + path + ' returned HTTP ' + res.status);
   }
@@ -113,6 +144,15 @@ function normalizeSpotifyUri(input) {
   return s;
 }
 
+/** Paint a range input's filled portion. The CSS gradient stops at --mp-progress. */
+function setProgress(el) {
+  const min = Number(el.min) || 0;
+  const max = Number(el.max) || 100;
+  const v = Number(el.value);
+  const pct = max > min ? ((v - min) / (max - min)) * 100 : 0;
+  el.style.setProperty('--mp-progress', pct + '%');
+}
+
 function fmtTime(ms) {
   if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '0:00';
   const total = Math.floor(ms / 1000);
@@ -142,14 +182,37 @@ const CONFIG_TEMPLATE = [
 
 /** Walks the user through installing and starting go-librespot. */
 class SetupModal extends Modal {
-  constructor(app, plugin) {
+  constructor(app, plugin, wedged) {
     super(app);
     this.plugin = plugin;
+    this.wedged = wedged;
   }
 
   onOpen() {
     const { contentEl } = this;
     contentEl.addClass('mp-setup');
+
+    // Reached from a "Not responding" state: the problem is not the setup, so
+    // lead with what actually helps.
+    if (this.wedged) {
+      contentEl.createEl('h2', { text: 'go-librespot is not responding' });
+      contentEl.createEl('p', {
+        text:
+          'The port is open but the API never answers, which means go-librespot ' +
+          'is running and stuck rather than missing. This shows up occasionally ' +
+          'after a network change or a wake from sleep, and the log fills with ' +
+          '"did not receive last pong ack from accesspoint".',
+      });
+      const fix = contentEl.createEl('p');
+      fix.createSpan({ text: 'Stop the process and start it again. To have that happen on its own, see ' });
+      fix.createEl('a', {
+        text: 'Keeping it running',
+        href: 'https://github.com/toshihirokmd/obsidian-mini-player#keeping-it-running',
+      });
+      fix.createSpan({ text: ' in the README — a service manager can restart it for you.' });
+      contentEl.createEl('hr');
+    }
+
     contentEl.createEl('h2', { text: 'Set up go-librespot' });
     contentEl.createEl('p', {
       text:
@@ -316,24 +379,34 @@ class MiniPlayerView extends ItemView {
     root.empty();
     root.addClass('mini-player');
 
+    // Blurred backdrop, painted from the same cover image as the artwork.
+    // Only one image is ever loaded — this element reuses it.
+    this.backdropEl = root.createDiv({ cls: 'mp-backdrop' });
+
+    const body = root.createDiv({ cls: 'mp-body' });
+
     // Cover art
-    this.artEl = root.createDiv({ cls: 'mp-art' });
+    this.artEl = body.createDiv({ cls: 'mp-art' });
     this.artImgEl = this.artEl.createEl('img', { cls: 'mp-art-img' });
     this.artImgEl.style.display = 'none';
-    this.artPlaceholderEl = this.artEl.createDiv({ cls: 'mp-art-ph', text: '♪' });
+    this.artPlaceholderEl = this.artEl.createDiv({ cls: 'mp-art-ph' });
+    setIcon(this.artPlaceholderEl, 'music');
 
     // Track info
-    const meta = root.createDiv({ cls: 'mp-meta' });
+    const meta = body.createDiv({ cls: 'mp-meta' });
     this.titleEl = meta.createDiv({ cls: 'mp-title', text: '—' });
     this.artistEl = meta.createDiv({ cls: 'mp-artist', text: '' });
 
     // Seek bar
-    const seekWrap = root.createDiv({ cls: 'mp-seek-wrap' });
+    const seekWrap = body.createDiv({ cls: 'mp-seek-wrap' });
     this.seekEl = seekWrap.createEl('input', { cls: 'mp-seek', type: 'range' });
     this.seekEl.min = '0';
     this.seekEl.max = '1000';
     this.seekEl.value = '0';
-    this.seekEl.addEventListener('input', () => { this.seeking = true; });
+    this.seekEl.addEventListener('input', () => {
+      this.seeking = true;
+      setProgress(this.seekEl);
+    });
     this.seekEl.addEventListener('change', async () => {
       const dur = this.status && this.status.track ? this.status.track.duration : 0;
       const pos = Math.floor((Number(this.seekEl.value) / 1000) * dur);
@@ -341,15 +414,19 @@ class MiniPlayerView extends ItemView {
       await this.act('/player/seek', 'POST', { position: pos });
     });
 
-    const times = root.createDiv({ cls: 'mp-times' });
+    const times = body.createDiv({ cls: 'mp-times' });
     this.posEl = times.createSpan({ text: '0:00' });
     this.durEl = times.createSpan({ text: '0:00' });
 
     // Transport
-    const ctrl = root.createDiv({ cls: 'mp-ctrl' });
-    this.prevBtn = ctrl.createEl('button', { cls: 'mp-btn', text: '⏮' });
-    this.playBtn = ctrl.createEl('button', { cls: 'mp-btn mp-btn-main', text: '▶' });
-    this.nextBtn = ctrl.createEl('button', { cls: 'mp-btn', text: '⏭' });
+    const ctrl = body.createDiv({ cls: 'mp-ctrl' });
+    this.prevBtn = ctrl.createEl('button', { cls: 'mp-btn' });
+    this.playBtn = ctrl.createEl('button', { cls: 'mp-btn mp-btn-main' });
+    this.nextBtn = ctrl.createEl('button', { cls: 'mp-btn' });
+
+    setIcon(this.prevBtn, 'skip-back');
+    setIcon(this.playBtn, 'play');
+    setIcon(this.nextBtn, 'skip-forward');
 
     this.prevBtn.setAttribute('aria-label', 'Previous track');
     this.playBtn.setAttribute('aria-label', 'Play or pause');
@@ -360,14 +437,18 @@ class MiniPlayerView extends ItemView {
     this.playBtn.onclick = () => this.act('/player/playpause', 'POST');
 
     // Volume
-    const volWrap = root.createDiv({ cls: 'mp-vol-wrap' });
-    volWrap.createSpan({ cls: 'mp-vol-icon', text: '🔉' });
+    const volWrap = body.createDiv({ cls: 'mp-vol-wrap' });
+    const volIcon = volWrap.createSpan({ cls: 'mp-vol-icon' });
+    setIcon(volIcon, 'volume-2');
     this.volEl = volWrap.createEl('input', { cls: 'mp-vol', type: 'range' });
     this.volEl.min = '0';
     this.volEl.max = '100';
     this.volEl.value = '60';
     this.volEl.setAttribute('aria-label', 'Volume');
-    this.volEl.addEventListener('input', () => { this.volumeDragging = true; });
+    this.volEl.addEventListener('input', () => {
+      this.volumeDragging = true;
+      setProgress(this.volEl);
+    });
     this.volEl.addEventListener('change', async () => {
       const steps = (this.status && this.status.volume_steps) || 100;
       const v = Math.round((Number(this.volEl.value) / 100) * steps);
@@ -376,18 +457,19 @@ class MiniPlayerView extends ItemView {
     });
 
     // Playlists header
-    const plHead = root.createDiv({ cls: 'mp-section-head' });
+    const plHead = body.createDiv({ cls: 'mp-section-head' });
     plHead.createSpan({ cls: 'mp-section-label', text: 'Playlists' });
     const plActions = plHead.createDiv({ cls: 'mp-section-actions' });
 
-    const addBtn = plActions.createEl('button', { cls: 'mp-mini-btn', text: '＋' });
+    const addBtn = plActions.createEl('button', { cls: 'mp-mini-btn' });
+    setIcon(addBtn, 'plus');
     addBtn.setAttribute('aria-label', 'Add a playlist from a URL');
     addBtn.onclick = () => new AddPlaylistModal(this.app, this.plugin).open();
 
-    this.plEl = root.createDiv({ cls: 'mp-playlists' });
+    this.plEl = body.createDiv({ cls: 'mp-playlists' });
     this.renderPlaylists();
 
-    this.statusEl = root.createDiv({ cls: 'mp-status' });
+    this.statusEl = body.createDiv({ cls: 'mp-status' });
   }
 
   renderPlaylists() {
@@ -398,20 +480,19 @@ class MiniPlayerView extends ItemView {
     if (list.length === 0) {
       this.plEl.createDiv({
         cls: 'mp-empty',
-        text: 'Press ＋ and paste a Spotify URL',
+        text: 'Add one with + — a Spotify URL can be pasted as-is',
       });
       return;
     }
 
     list.forEach((p) => {
-      const row = this.plEl.createDiv({ cls: 'mp-pl-row' });
+      const wrap = this.plEl.createDiv({ cls: 'mp-chip-wrap' });
 
-      const btn = row.createEl('button', { cls: 'mp-pl-btn' });
-      btn.createSpan({ cls: 'mp-pl-icon', text: '▶' });
-      btn.createSpan({ cls: 'mp-pl-name', text: p.name || p.uri });
-      btn.onclick = () => this.plugin.playUri(p.uri, p.name);
+      const chip = wrap.createEl('button', { cls: 'mp-chip', text: p.name || p.uri });
+      chip.onclick = () => this.plugin.playUri(p.uri, p.name);
 
-      const del = row.createEl('button', { cls: 'mp-pl-del', text: '×' });
+      const del = wrap.createEl('button', { cls: 'mp-chip-del' });
+      setIcon(del, 'x');
       del.setAttribute('aria-label', 'Remove');
       del.onclick = async (ev) => {
         ev.stopPropagation();
@@ -442,27 +523,37 @@ class MiniPlayerView extends ItemView {
       st = res.json;
     } catch (e) {
       this.status = null;
-      this.setDisconnected();
+      this.setDisconnected(e instanceof TimeoutError);
       return;
     }
     this.status = st;
     this.render(st);
   }
 
-  setDisconnected() {
+  /**
+   * @param {boolean} wedged true when the port answered but the API did not —
+   *   go-librespot is running and stuck, so restarting it is the fix. False
+   *   means nothing is listening at all.
+   */
+  setDisconnected(wedged) {
     this.statusEl.style.display = '';
     this.statusEl.empty();
     this.statusEl.createSpan({ cls: 'mp-dot mp-dot-off' });
-    this.statusEl.createSpan({ cls: 'mp-status-text', text: 'Not connected' });
-    const help = this.statusEl.createEl('button', { cls: 'mp-mini-btn', text: '?' });
-    help.setAttribute('aria-label', 'Setup guide');
-    help.onclick = () => new SetupModal(this.app, this.plugin).open();
+    this.statusEl.createSpan({
+      cls: 'mp-status-text',
+      text: wedged ? 'Not responding' : 'Not running',
+    });
+    const help = this.statusEl.createEl('button', { cls: 'mp-mini-btn' });
+    setIcon(help, 'help-circle');
+    help.setAttribute('aria-label', wedged ? 'go-librespot is not responding' : 'Setup guide');
+    help.onclick = () => new SetupModal(this.app, this.plugin, wedged).open();
 
     this.titleEl.setText('—');
     this.artistEl.setText('');
-    this.playBtn.setText('▶');
+    setIcon(this.playBtn, 'play');
     this.artImgEl.style.display = 'none';
     this.artPlaceholderEl.style.display = '';
+    this.backdropEl.addClass('is-hidden');
   }
 
   render(st) {
@@ -472,34 +563,50 @@ class MiniPlayerView extends ItemView {
       this.titleEl.setText(t.name || '—');
       this.artistEl.setText(Array.isArray(t.artist_names) ? t.artist_names.join(', ') : '');
       if (t.album_cover_url) {
-        if (this.artImgEl.src !== t.album_cover_url) this.artImgEl.src = t.album_cover_url;
+        if (this.artImgEl.src !== t.album_cover_url) {
+          this.artImgEl.src = t.album_cover_url;
+          // Same URL as the <img>, so the browser serves it from cache.
+          this.backdropEl.style.backgroundImage = 'url("' + t.album_cover_url + '")';
+        }
         this.artImgEl.style.display = '';
         this.artPlaceholderEl.style.display = 'none';
+        this.backdropEl.removeClass('is-hidden');
       } else {
         this.artImgEl.style.display = 'none';
         this.artPlaceholderEl.style.display = '';
+        this.backdropEl.addClass('is-hidden');
       }
-      this.posEl.setText(fmtTime(t.position));
-      this.durEl.setText(fmtTime(t.duration));
-      if (!this.seeking && t.duration > 0) {
-        this.seekEl.value = String(Math.floor((t.position / t.duration) * 1000));
+      // During a track change the reported position can briefly exceed the
+      // duration, which shows as an elapsed time longer than the track.
+      const dur = t.duration || 0;
+      const pos = dur > 0 ? Math.min(t.position, dur) : t.position;
+      this.posEl.setText(fmtTime(pos));
+      this.durEl.setText(fmtTime(dur));
+      if (!this.seeking && dur > 0) {
+        this.seekEl.value = String(Math.floor((pos / dur) * 1000));
+        setProgress(this.seekEl);
       }
     } else {
       this.titleEl.setText('Nothing playing');
       this.artistEl.setText('');
       this.posEl.setText('0:00');
       this.durEl.setText('0:00');
-      if (!this.seeking) this.seekEl.value = '0';
+      if (!this.seeking) {
+        this.seekEl.value = '0';
+        setProgress(this.seekEl);
+      }
       this.artImgEl.style.display = 'none';
       this.artPlaceholderEl.style.display = '';
+      this.backdropEl.addClass('is-hidden');
     }
 
     const playing = t && !st.paused && !st.stopped;
-    this.playBtn.setText(playing ? '⏸' : '▶');
+    setIcon(this.playBtn, playing ? 'pause' : 'play');
 
     if (!this.volumeDragging && typeof st.volume === 'number') {
       const steps = st.volume_steps || 100;
       this.volEl.value = String(Math.round((st.volume / steps) * 100));
+      setProgress(this.volEl);
     }
 
     // Say nothing while things are fine; the same line every 3 seconds is just noise.

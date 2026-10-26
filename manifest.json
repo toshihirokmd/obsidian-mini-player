@@ -1,10 +1,11 @@
 {
   "id": "mini-player",
   "name": "Mini Player",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "minAppVersion": "1.4.0",
   "description": "A compact sidebar player that controls a local go-librespot instance to play Spotify playlists. Requires Spotify Premium and a separate go-librespot install.",
-  "author": "toshihiro",
+  "author": "Toshihiro",
   "authorUrl": "https://github.com/toshihirokmd",
+  "fundingUrl": "https://buymeacoffee.com/toshihirokmd",
   "isDesktopOnly": true
 }

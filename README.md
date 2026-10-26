@@ -103,6 +103,89 @@ a one-time step.
 Until authorization completes, `GET /status` does not respond — so the plugin will show
 **Not connected** even though the process is running.
 
+## Keeping it running
+
+go-librespot is a long-running service, and this plugin does not manage it —
+starting, stopping and restarting it is left to your operating system, where
+that job belongs. Set it up once and it will be there whenever Obsidian is.
+
+### Linux — systemd user service
+
+`~/.config/systemd/user/go-librespot.service`:
+
+```ini
+[Unit]
+Description=go-librespot
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/go-librespot --config_dir %h/.config/go-librespot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now go-librespot
+```
+
+### macOS — launchd agent
+
+`~/Library/LaunchAgents/go-librespot.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>go-librespot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/go-librespot</string>
+    <string>--config_dir</string>
+    <string>/Users/YOU/Library/Application Support/go-librespot</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+```
+launchctl load ~/Library/LaunchAgents/go-librespot.plist
+```
+
+### Windows
+
+Put a shortcut in the startup folder (`Win+R` → `shell:startup`) so it launches
+at sign-in. To avoid a console window, point the shortcut at a one-line VBScript
+rather than the executable:
+
+```vbscript
+' start-go-librespot.vbs
+Set ws = CreateObject("WScript.Shell")
+ws.Run "cmd /c cd /d ""C:\path\to\go-librespot"" && go-librespot.exe --config_dir conf > run.log 2>&1", 0, False
+```
+
+Task Scheduler can also restart the task if it exits, under the task's
+**Settings** tab.
+
+### When it stops responding rather than exiting
+
+Sometimes go-librespot keeps running but stops answering. The plugin shows
+**Not responding**, and its log repeats `did not receive last pong ack from
+accesspoint`. It tends to follow a network change or a wake from sleep
+(upstream issues [#223](https://github.com/devgianlu/go-librespot/issues/223)
+and [#300](https://github.com/devgianlu/go-librespot/issues/300)).
+
+**A service manager will not catch this** — the process is alive, so nothing
+looks wrong from the outside. Stop it and start it again. If it happens often
+enough to bother you, add a periodic health check that requests `/status` and
+restarts the service when it does not answer.
+
 ## Usage
 
 - Click the **play** icon in the ribbon, or run **Mini Player: Open mini player** from the command palette.
